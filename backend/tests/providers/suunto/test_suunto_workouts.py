@@ -169,6 +169,30 @@ class TestSuuntoWorkouts:
         # Assert
         assert metrics["steps_count"] is None
 
+    def test_workout_accepts_fractional_total_distance(
+        self,
+        suunto_workouts: SuuntoWorkouts,
+        sample_workout_data: dict,
+    ) -> None:
+        """Suunto reports totalDistance as a float, so fractional meters must parse.
+
+        Regression test: the field was typed ``int``, so a real distance such as
+        21381.4 m raised ``int_from_float`` during ``WorkoutJSON(**w)``. Because
+        load_data parses the whole payload in one list comprehension, a single
+        fractional-distance workout aborted the entire sync with an HTTP 500.
+        """
+        # Arrange
+        workout_data = sample_workout_data.copy()
+        workout_data["totalDistance"] = 21381.4
+
+        # Act
+        workout = SuuntoWorkoutJSON(**workout_data)
+        metrics = suunto_workouts._build_metrics(workout)
+
+        # Assert
+        assert workout.totalDistance == 21381.4
+        assert metrics["distance"] == Decimal("21381.4")
+
     def test_normalize_workout_creates_event_record(
         self,
         suunto_workouts: SuuntoWorkouts,
@@ -351,4 +375,37 @@ class TestSuuntoWorkouts:
         mock_create.assert_called_once()
         mock_create_detail.assert_called_once()
         # Verify data source creation was attempted
+        mock_ensure_data_source.assert_called_once()
+
+    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_detail")
+    @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
+    def test_process_push_activity_creates_record_and_detail(
+        self,
+        mock_ensure_data_source: MagicMock,
+        mock_create_detail: MagicMock,
+        mock_create: MagicMock,
+        suunto_workouts: SuuntoWorkouts,
+        db: Session,
+        sample_workout_data: dict,
+    ) -> None:
+        """Webhook push path must persist both the event_record and its detail.
+
+        create_detail is what schedules the after_commit listener that emits
+        the workout.created outgoing webhook, so skipping it silently drops
+        live workouts from every downstream consumer.
+        """
+        from tests.factories import UserFactory
+
+        user = UserFactory()
+        expected_id = uuid4()
+        mock_create.return_value.id = expected_id
+
+        result = suunto_workouts.process_push_activity(db, user.id, sample_workout_data)
+
+        assert result == expected_id
+        mock_create.assert_called_once()
+        mock_create_detail.assert_called_once()
+        detail_arg = mock_create_detail.call_args.args[1]
+        assert detail_arg.record_id == expected_id
         mock_ensure_data_source.assert_called_once()

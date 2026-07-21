@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Literal
 from uuid import UUID
 
 from celery import current_app as celery_app
@@ -11,9 +11,12 @@ from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LiveSyncMode
+from app.schemas.enums import SeriesType
+from app.schemas.enums.health_score_category import HealthScoreCategory
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
+from app.services.providers.templates.base_webhook_service import BaseWebhookService
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.utils.exceptions import UnsupportedProviderError
 
@@ -28,6 +31,29 @@ class HistoricalSyncResult:
     days: int | None
     start_date: str | None = None
     end_date: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderCoverage:
+    """Declares what data a provider actually delivers, grouped by API layer.
+
+    timeseries:             SeriesType values available via /timeseries endpoint
+    workout_fields:         EventRecordDetail fields populated in workout records
+    sleep_fields:           EventRecordDetail fields populated in sleep records
+    menstrual_cycle_fields: EventRecordDetail fields populated in menstrual-cycle records
+    health_scores:          HealthScoreCategory values produced by this provider
+
+    Define the frozensets in the provider's coverage.py and assign here in
+    strategy.py — keeps implementation files free of metadata declarations.
+    A provider that delivers no data for a dimension simply omits it (the
+    default empty frozenset), so no empty placeholders are needed elsewhere.
+    """
+
+    timeseries: frozenset[SeriesType] = field(default_factory=frozenset)
+    workout_fields: frozenset[str] = field(default_factory=frozenset)
+    sleep_fields: frozenset[str] = field(default_factory=frozenset)
+    menstrual_cycle_fields: frozenset[str] = field(default_factory=frozenset)
+    health_scores: frozenset[HealthScoreCategory] = field(default_factory=frozenset)
 
 
 @dataclass(frozen=True)
@@ -56,6 +82,20 @@ class ProviderCapabilities:
         Provider sends a lightweight ping to our webhook.
         Actual data must be fetched via REST (``rest_pull`` must be
         ``True``). Oura, Strava, Fitbit, Polar.
+    webhook_registration_api:
+        Provider exposes an API to programmatically register and update
+        webhook subscriptions. When ``True``, switching to webhook live-sync
+        mode triggers the ``register_provider_webhooks`` Celery task.
+        Polar, Oura, Strava.
+    webhook_inbound_secret:
+        Provider signs inbound webhook payloads with HMAC; the signing
+        secret is returned by the registration API (not pre-configured in
+        env vars) and is stored in ``provider_settings.webhook_secret``.
+        Must be used together with ``webhook_registration_api=True``.
+        Currently: Polar.
+    max_historical_days:
+        Hard upper limit on how far back the provider allows data to be
+        fetched. ``None`` means no known limit. Garmin: 30 days.
     """
 
     rest_pull: bool = False
@@ -65,14 +105,16 @@ class ProviderCapabilities:
     webhook_stream: bool = False
     webhook_ping: bool = False
     webhook_registration_api: bool = False
+    webhook_inbound_secret: bool = False
     max_historical_days: int | None = None
-    """Hard limit on how many days of history the provider allows. None = no known limit."""
 
     def __post_init__(self) -> None:
         if self.webhook_stream and self.webhook_ping:
             raise ValueError("webhook_stream and webhook_ping are mutually exclusive")
         if self.webhook_ping and not self.rest_pull:
             raise ValueError("webhook_ping requires rest_pull=True (data must be fetched via REST after the ping)")
+        if self.webhook_inbound_secret and not self.webhook_registration_api:
+            raise ValueError("webhook_inbound_secret requires webhook_registration_api=True")
 
 
 class BaseProviderStrategy(ABC):
@@ -89,6 +131,7 @@ class BaseProviderStrategy(ABC):
         self.workouts: BaseWorkoutsTemplate | None = None
         self.data_247: Base247DataTemplate | None = None
         self.webhooks: BaseWebhookHandler | None = None
+        self.webhook_service: BaseWebhookService | None = None
 
     @property
     @abstractmethod
@@ -111,6 +154,15 @@ class BaseProviderStrategy(ABC):
         if self.api_version:
             return f"{self.api_base_url}/api/{self.api_version}"
         return self.api_base_url
+
+    @property
+    def coverage(self) -> ProviderCoverage:
+        """Declares what data this provider delivers across all API layers.
+
+        Override in each provider strategy by returning a ProviderCoverage built
+        from constants defined in the provider's coverage.py.
+        """
+        return ProviderCoverage()
 
     @property
     @abstractmethod
@@ -202,14 +254,6 @@ class BaseProviderStrategy(ABC):
         if caps.webhook_ping or caps.webhook_stream:
             return LiveSyncMode.WEBHOOK
         return None
-
-    async def register_webhooks(self, callback_url: str) -> Any:
-        """Register webhook subscriptions for this provider.
-
-        Only meaningful when ``capabilities.webhook_registration_api`` is True.
-        Concrete strategies that support programmatic registration should override this.
-        """
-        raise NotImplementedError(f"Provider '{self.name}' does not support programmatic webhook registration")
 
     @property
     def icon_url(self) -> str:
