@@ -22,10 +22,11 @@ from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDeta
 from app.schemas.model_crud.activities.sleep import SleepStage
 from app.services.event_record_service import event_record_service
 from app.services.providers.api_client import make_authenticated_request
-from app.services.providers.google.health_api.helpers import (
+from app.services.providers.google_health.helpers import (
     GOOGLE_HEALTH_API_SOURCE,
     extract_source,
     parse_interval,
+    parse_page,
     parse_rfc3339,
     physical_interval,
     read_number,
@@ -45,12 +46,16 @@ class GoogleHealthApiSleep:
     def __init__(self, oauth: BaseOAuthTemplate, connection_repo: UserConnectionRepository, api_base_url: str):
         self.oauth = oauth
         self.connection_repo = connection_repo
-        self.provider_name = "google"
+        self.provider_name = "google_health"
         self.api_base_url = api_base_url
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def load_and_save(self, db: DbSession, user_id: UUID, start_time: datetime, end_time: datetime) -> int:
-        """Fetch sleep sessions starting in the window and merge-save each."""
+        """Fetch sleep sessions ending in the window and merge-save each.
+
+        Keyed on the end, like the fetch filter: an overnight session starts before any
+        morning window and would never be kept if the start were tested.
+        """
         count = 0
         for point in self._fetch(db, user_id, start_time, end_time):
             sleep = point.get("sleep")
@@ -58,7 +63,7 @@ class GoogleHealthApiSleep:
                 continue
             interval = sleep.get("interval") or {}
             start, end = parse_interval(interval)
-            if start is None or end is None or not (start_time <= start < end_time):
+            if start is None or end is None or not (start_time <= end < end_time):
                 continue
             record, detail = self._normalize(point, sleep, interval, start, end, user_id)
             event_record_service.create_or_merge_sleep(db, user_id, record, detail, settings.sleep_end_gap_minutes)
@@ -66,8 +71,10 @@ class GoogleHealthApiSleep:
         return count
 
     def _fetch(self, db: DbSession, user_id: UUID, start_time: datetime, end_time: datetime) -> list[dict[str, Any]]:
-        window_start = physical_interval(start_time, end_time)["startTime"]
-        time_filter = f'sleep.interval.end_time >= "{window_start}"'
+        window = physical_interval(start_time, end_time)
+        time_filter = (
+            f'sleep.interval.end_time >= "{window["startTime"]}" AND sleep.interval.end_time < "{window["endTime"]}"'
+        )
         points: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:
@@ -92,10 +99,9 @@ class GoogleHealthApiSleep:
                 user_id=str(user_id),
                 trace_id=self.LIST_ENDPOINT,
             )
-            if not isinstance(response, dict):
-                break
-            points.extend(response.get("dataPoints", []))
-            page_token = response.get("nextPageToken")
+            page = parse_page(response, self.LIST_ENDPOINT)
+            points.extend(page.data_points)
+            page_token = page.next_page_token
             if not page_token:
                 break
         return points
@@ -117,7 +123,7 @@ class GoogleHealthApiSleep:
         record = EventRecordCreate(
             id=record_id,
             category="sleep",
-            provider=ProviderName.GOOGLE.value,
+            provider=ProviderName.GOOGLE_HEALTH.value,
             source=GOOGLE_HEALTH_API_SOURCE,
             source_name=source_name,
             device_model=device_model,
