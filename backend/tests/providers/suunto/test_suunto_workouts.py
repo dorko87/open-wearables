@@ -56,7 +56,8 @@ class TestSuuntoWorkouts:
     def sample_workout_data(self) -> dict:
         """Sample Suunto workout data for testing."""
         return {
-            "workoutId": 123456789,
+            "workoutId": 0,
+            "workoutKey": "6aa10da139e69418a2fa8db1",
             "activityId": 1,  # Running
             "startTime": 1705309200000,  # 2024-01-15T08:00:00 in milliseconds
             "stopTime": 1705312800000,  # 2024-01-15T09:00:00 in milliseconds
@@ -64,6 +65,8 @@ class TestSuuntoWorkouts:
             "totalDistance": 10000,
             "stepCount": 8500,
             "energyConsumption": 650,
+            "avgSpeed": 2.78,
+            "maxSpeed": 4.1,
             "hrdata": {
                 "workoutMaxHR": 175,
                 "workoutAvgHR": 145,
@@ -129,6 +132,8 @@ class TestSuuntoWorkouts:
         assert metrics["steps_count"] == 8500
         assert metrics["energy_burned"] == Decimal("650")
         assert metrics["distance"] == Decimal("10000")
+        assert metrics["average_speed"] == Decimal("2.78")
+        assert metrics["max_speed"] == Decimal("4.1")
 
     def test_build_metrics_with_missing_heart_rate(
         self,
@@ -212,7 +217,7 @@ class TestSuuntoWorkouts:
         assert record.source_name == "Suunto 9 Peak"
         assert record.device_model == "Suunto 9 Peak"  # Uses displayName from gear
         assert record.duration_seconds == 3600
-        assert record.external_id == "123456789"
+        assert record.external_id == "6aa10da139e69418a2fa8db1"
         assert record.user_id == user_id
 
     def test_normalize_workout_without_device(
@@ -376,6 +381,37 @@ class TestSuuntoWorkouts:
         mock_create_detail.assert_called_once()
         # Verify data source creation was attempted
         mock_ensure_data_source.assert_called_once()
+
+    @patch.object(SuuntoWorkouts, "_make_api_request")
+    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_detail")
+    @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
+    def test_load_data_walks_every_page(
+        self,
+        mock_ensure_data_source: MagicMock,
+        mock_create_detail: MagicMock,
+        mock_create: MagicMock,
+        mock_request: MagicMock,
+        suunto_workouts: SuuntoWorkouts,
+        db: Session,
+        sample_workout_data: dict,
+    ) -> None:
+        """Historical sync must not stop at the first page of 100 workouts."""
+        from tests.factories import UserFactory
+
+        user = UserFactory()
+        mock_request.side_effect = [
+            {"payload": [sample_workout_data] * 100},
+            {"payload": [sample_workout_data] * 100},
+            {"payload": [sample_workout_data] * 30},
+        ]
+
+        result = suunto_workouts.load_data(db, user.id, start_date="2025-01-01T00:00:00Z")
+
+        assert result == 230
+        pages = [call.kwargs["params"] for call in mock_request.call_args_list]
+        assert [(page["offset"], page["limit"]) for page in pages] == [(0, 100), (100, 100), (200, 100)]
+        assert {page["since"] for page in pages} == {1735689600000}
 
     @patch("app.services.event_record_service.event_record_service.create")
     @patch("app.services.event_record_service.event_record_service.create_detail")

@@ -29,7 +29,7 @@ Internal endpoints (dashboard management, team settings, webhook receivers) are 
   <Card
     title="OpenAPI JSON"
     icon="file-code"
-    href="https://api.openwearables.io/openapi.json"
+    href="https://github.com/the-momentum/open-wearables/blob/main/docs/openapi.json"
   >
     Machine-readable OpenAPI 3.1 specification
   </Card>
@@ -74,6 +74,8 @@ X-Open-Wearables-API-Key: YOUR_API_KEY
 
 API keys are shared across the whole deployment. Every developer account can see, rotate, and delete every key, see [Credentials](/developer-portal/settings/credentials#keys-are-shared-across-the-deployment).
 
+An API key is an administrator key: it gives access to the data of every user in the deployment, so keep it on your backend only, see [Credentials](/developer-portal/settings/credentials#api-keys).
+
 <Warning>
   Keep your API keys secure. Never commit them to version control or expose them in client-side code.
 </Warning>
@@ -117,9 +119,14 @@ The API uses different response formats depending on the endpoint type:
 
 ### Error Response
 
+Errors are [RFC 9457 Problem Details](/api-reference/guides/error-handling), served as `application/problem+json`. Branch on `code`; `detail` is for people:
+
 ```json
 {
-  "detail": "Error message describing what went wrong"
+  "title": "Not Found",
+  "status": 404,
+  "detail": "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found.",
+  "code": "NOT_FOUND"
 }
 ```
 
@@ -128,10 +135,14 @@ The API uses different response formats depending on the endpoint type:
 - `200 OK` - Request succeeded
 - `201 Created` - Resource created successfully
 - `204 No Content` - Request succeeded, no content to return
-- `400 Bad Request` - Invalid request parameters
+- `400 Bad Request` - The request can't be carried out (see the error's `code`)
 - `401 Unauthorized` - Authentication required or invalid
+- `403 Forbidden` - Not allowed to act on this resource
 - `404 Not Found` - Resource not found
+- `409 Conflict` - Duplicate resource, or the provider connection needs reauthorization
+- `422 Unprocessable Content` - Request validation failed; `errors` lists every invalid value
 - `500 Internal Server Error` - Server error
+- `502 Bad Gateway` / `503 Service Unavailable` - A provider or a service the deployment depends on failed
 
 ## Pagination
 
@@ -193,10 +204,12 @@ Many endpoints support filtering and sorting. Check individual endpoint document
 
 ## OpenAPI Specification
 
-The complete OpenAPI specification is available at:
-- **Swagger UI:** `https://api.openwearables.io/docs`
-- **OpenAPI JSON:** `https://api.openwearables.io/openapi.json`
+This reference is generated from [`docs/openapi.json`](https://github.com/the-momentum/open-wearables/blob/main/docs/openapi.json), which is exported from the API code on every change, so it always describes the current `main` branch.
+
+Every Open Wearables instance also serves the spec for the exact version it runs:
+- **Swagger UI:** `https://<your-instance>/docs`
+- **OpenAPI JSON:** `https://<your-instance>/openapi.json`
 
 <Tip>
-  The OpenAPI specification is auto-generated from the API code and is always the most accurate reference.
+  If you self-host an older release, the spec served by your own instance is the accurate reference for it.
 </Tip>

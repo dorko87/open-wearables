@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import logging
 import time
@@ -8,12 +9,17 @@ from urllib.parse import parse_qsl, urlencode
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.config import settings
+from app.services.endpoint_usage import caller_type, endpoint_usage, route_key
 from app.utils.config_utils import AccessLogLevel
-from app.utils.structured_logging import log_structured
+from app.utils.sdk_request_metadata import sdk_request_metadata
+from app.utils.structured_logging import get_logger
+from app.utils.webhook_callback import redact_callback_url
 
-logger = logging.getLogger("app.access")
+logger = get_logger("app.access")
 
 # Query keys whose value authenticates a request and must never reach the logs.
 # Providers that sign inbound webhooks use a header instead; these three carry the
@@ -26,17 +32,21 @@ _REDACTED = "REDACTED"  # plain word: urlencode would percent-encode brackets
 
 
 def _log_path(request: Request) -> str:
-    """The request path with any secret-bearing query values masked."""
+    """The request path with any secret-bearing query values and webhook callback token masked."""
+    path = redact_callback_url(request.url.path)
     query = request.url.query
     if not query:
-        return request.url.path
+        return path
     try:
         pairs = parse_qsl(query, keep_blank_values=True)
     except ValueError:
         # Unparseable query: drop it wholesale rather than risk logging a secret.
-        return f"{request.url.path}?{_REDACTED}"
-    masked = [(key, _REDACTED if key.lower() in _REDACTED_QUERY_KEYS else value) for key, value in pairs]
-    return f"{request.url.path}?{urlencode(masked)}"
+        return f"{path}?{_REDACTED}"
+    # A value can itself be a callback URL (?callback_url= of the subscription endpoints).
+    masked = [
+        (key, _REDACTED if key.lower() in _REDACTED_QUERY_KEYS else redact_callback_url(value)) for key, value in pairs
+    ]
+    return f"{path}?{urlencode(masked)}"
 
 
 def add_cors_middleware(app: FastAPI) -> None:
@@ -101,6 +111,7 @@ def add_access_log_middleware(app: FastAPI) -> None:
                 attributes["request_bytes"] = int(content_length)
             except ValueError:
                 attributes["request_bytes"] = content_length
+        attributes |= sdk_request_metadata(request.headers)
         if response_body is not None:
             attributes["response_body"] = response_body
         if status >= 400:
@@ -132,7 +143,7 @@ def add_access_log_middleware(app: FastAPI) -> None:
             attributes["traceback"] = formatted_traceback
         # a logging failure must never break request handling
         with contextlib.suppress(Exception):
-            log_structured(logger, "error" if status >= 400 else "info", "http_request", **attributes)
+            logger.log(logging.ERROR if status >= 400 else logging.INFO, "http_request", **attributes)
 
     @app.middleware("http")
     async def access_log(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -155,3 +166,56 @@ def add_access_log_middleware(app: FastAPI) -> None:
 
         emit(request, response.status_code, round((time.perf_counter() - start) * 1000, 1), response_body)
         return response
+
+
+class _EndpointUsageMiddleware:
+    """Counts requests per route template for the telemetry ping.
+
+    Plain ASGI rather than BaseHTTPMiddleware: the count is taken when the response
+    starts, so a long-lived stream is counted once up front and never buffered.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        recorded = False
+
+        async def send_and_record(message: Message) -> None:
+            nonlocal recorded
+            if message["type"] == "http.response.start" and not recorded:
+                recorded = True
+                _record_endpoint_usage(scope, message["status"])
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_and_record)
+        except Exception:
+            # Unhandled exception: the 500 is sent by the server error middleware above us.
+            if not recorded:
+                _record_endpoint_usage(scope, 500)
+            raise
+
+
+def _record_endpoint_usage(scope: Scope, status: int) -> None:
+    # telemetry must never break request handling
+    with contextlib.suppress(Exception):
+        key = route_key(scope, status)
+        if key is None:
+            return
+        headers = Headers(scope=scope)
+        auth = caller_type(headers.get("authorization"), headers.get("x-open-wearables-api-key"))
+        endpoint_usage.record(key, auth, status)
+        if endpoint_usage.claim_flush():
+            # Redis I/O stays off the event loop.
+            asyncio.get_running_loop().run_in_executor(None, endpoint_usage.flush)
+
+
+def add_endpoint_usage_middleware(app: FastAPI) -> None:
+    # Not installed at all when opted out, so a disabled instance counts nothing.
+    if settings.telemetry_enabled:
+        app.add_middleware(_EndpointUsageMiddleware)
